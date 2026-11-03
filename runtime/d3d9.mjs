@@ -12,7 +12,7 @@ function snapshot(m,address,length,previous){
   return source.slice();
 }
 export class Direct3D9 {
-  constructor(host){this.host=host;this.m=host.m;this.com=new COM(host);this.frames=0;this.draws=[];this.devices=[];}
+  constructor(host){this.host=host;this.m=host.m;this.com=new COM(host);this.frames=0;this.draws=[];this.devices=[];this.rasterEpoch=performance.now()-host.millis;}
   create(){return this.com.create('IDirect3D9',this.d3dMethods).address;}
   mode(out){[640,480,60,22].forEach((n,i)=>this.m.u32(out+i*4,n));return 0;}
   caps(out){
@@ -50,10 +50,11 @@ export class Direct3D9 {
   }
   deviceMethods={
     TestCooperativeLevel:zero,GetAvailableTextureMem:()=>256*1024*1024,EvictManagedResources:zero,GetDeviceCaps:a=>this.caps(a[0]),GetDisplayMode:a=>this.mode(a[1]),
+    GetRasterStatus:a=>{const interval=1000/60,elapsed=performance.now()-this.rasterEpoch,phase=((elapsed%interval)+interval)%interval,scanLine=Math.min(524,Math.floor(phase/interval*525)),inVBlank=scanLine>=480?1:0;this.m.u32(a[1],inVBlank);this.m.u32(a[1]+4,scanLine);this.rasterStatus={swapChain:a[0],output:a[1],inVBlank,scanLine};return 0;},
     GetDirect3D:a=>{this.m.u32(a[0],this.create());return 0;},
     SetCursorProperties:zero,SetCursorPosition:zero,ShowCursor:zero,
     BeginScene:zero,EndScene:zero,
-    Present:()=>{this.frames++;const interval=1000/60,previous=this.vblankTime??this.host.millis;this.vblankTime=previous+Math.max(1,Math.ceil((this.host.millis-previous-1e-7)/interval))*interval;this.host.millis=this.vblankTime;this.host.yielded=true;this.m.cpu.emu_stop();this.onPresent?.(this.device,this.draws);this.draws=[];return 0;},
+    Present:()=>{this.frames++;const interval=1000/60,previous=this.vblankTime??this.host.millis;this.vblankTime=previous+Math.max(1,Math.ceil((this.host.millis-previous-1e-7)/interval))*interval;this.host.millis=this.vblankTime;this.rasterEpoch=performance.now()-this.vblankTime;this.host.yielded=true;this.m.cpu.emu_stop();this.onPresent?.(this.device,this.draws);this.draws=[];return 0;},
     Reset:a=>{this.device.params=this.m.bytes(a[0],56);return 0;},
     GetBackBuffer:a=>{const s=this.device.back;this.com.addRef(s);this.m.u32(a[3],s.address);return 0;},
     GetRenderTarget:a=>{const s=this.device.target;this.com.addRef(s);this.m.u32(a[1],s.address);return 0;},GetDepthStencilSurface:a=>{const s=this.device.depthTarget;if(s)this.com.addRef(s);this.m.u32(a[0],s?.address??0);return s?0:0x88760866;},

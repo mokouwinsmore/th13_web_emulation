@@ -17,16 +17,16 @@ export class Scheduler {
     h.sound.advance();
     for(const [timerId,timer] of h.handles)if(timer.kind==='multimedia-timer'){timer.interval=Math.max(1,timer.interval);timer.pending??=[];while(h.millis-timer.last>=timer.interval){timer.last+=timer.interval;if(timer.flags&0x10){const e=h.handles.get(timer.callback);if(e)e.signaled=true;}else if(timer.callback)timer.pending.push(timer.last);if(!(timer.flags&1)){timer.last=Infinity;break;}}this.queueTimer(timerId,timer);}
     this.addPending();
-    for(const t of this.threads){if(t.done||h.handles.get(t.id)?.suspended||t.ready>h.millis||(t.wait&& !h.handles.get(t.wait)?.done)||(t.lock&&h.critical.get(t.lock)?.owner&&h.critical.get(t.lock)?.owner!==t.id))continue;
-      do{ran=true;h.currentThreadId=t.id;h.callbackTime=t.eventTime;h.sleepMs=0;h.waitHandle=0;h.waitLock=0;h.yielded=false;m.cpu.context_restore(t.context);
+    for(const t of this.threads){const waitDone=t.wait&&h.handles.get(t.wait)?.done,waitTimedOut=t.wait&&t.waitUntil!==undefined&&t.waitUntil!==Infinity&&h.millis>=t.waitUntil;if(t.done||h.handles.get(t.id)?.suspended||t.ready>h.millis||(t.wait&&!waitDone&&!waitTimedOut)||(t.lock&&h.critical.get(t.lock)?.owner&&h.critical.get(t.lock)?.owner!==t.id))continue;if(waitDone||waitTimedOut){t.wait=0;t.waitUntil=undefined;}
+      do{ran=true;h.currentThreadId=t.id;h.callbackTime=t.eventTime;h.sleepMs=0;h.waitHandle=0;h.waitDeadline=undefined;h.waitLock=0;h.yielded=false;m.cpu.context_restore(t.context);
       m.cpu.emu_start(m.reg('EIP'),m.returnAddress,0,limit);this.capture(t);
       if(m.reg('EIP')===m.returnAddress){t.done=true;if(h.handles.has(t.id))h.handles.get(t.id).done=true;}
-      t.ready=h.millis+h.sleepMs;t.wait=h.waitHandle;t.lock=h.waitLock;
+      t.ready=h.millis+h.sleepMs;t.wait=h.waitHandle;t.waitUntil=h.waitDeadline;t.lock=h.waitLock;
       const timer=h.handles.get(t.timer);if(t.done&&timer&&this.queueTimer(t.timer,timer)){this.addPending();continue;}break;
       }while(true);h.callbackTime=undefined;
       if(h.exitCode!==undefined)break;
     }
-    if(!ran){const due=this.threads.filter(t=>!t.done&&!t.wait).map(t=>t.ready);if(due.length)h.millis=Math.max(h.millis,Math.min(...due));}
+    if(!ran){const due=this.threads.filter(t=>!t.done).flatMap(t=>t.wait?(t.waitUntil===undefined||t.waitUntil===Infinity?[]:[t.waitUntil]):[t.ready]);if(due.length)h.millis=Math.max(h.millis,Math.min(...due));}
     if(h.millis===before)h.millis+=1;
     return ran;
   }

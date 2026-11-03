@@ -7,7 +7,9 @@ import {installMidi} from './midi.mjs';
 
 export class Win32Host {
   constructor(machine,files=new Map(),{epochMs=Date.now(),timezoneMinutes=new Date(epochMs).getTimezoneOffset(),language='jp',program=language==='chs'?'th10chs.exe':'th10.exe'}={}){
-    this.m=machine;this.files=files;this.handles=new Map();this.nextHandle=0x200;this.allocations=new Map();this.freeBlocks=[];this.calls=new Map();this.error=0;this.tls=new Map();this.nextTLS=0;this.currentThreadId=1;this.millis=1000;this.pendingThreads=[];this.messages=[];this.critical=new Map();this.log=[];
+    this.m=machine;this.files=files;this.handles=new Map();this.nextHandle=0x200;this.allocations=new Map();this.freeBlocks=[];this.calls=new Map();this.error=0;this.tls=new Map();this.nextTLS=0;this.waits=new Map();this.currentThreadId=1;this.millis=1000;this.pendingThreads=[];this.messages=[];this.critical=new Map();this.log=[];
+    this.ciSqrtStub=machine.allocate(3);machine.cpu.mem_write(this.ciSqrtStub,[0xd9,0xfa,0xc3]);
+    this.ciAtanStub=machine.allocate(5);machine.cpu.mem_write(this.ciAtanStub,[0xd9,0xe8,0xd9,0xf3,0xc3]);
     this.epochMs=epochMs;this.timezoneMinutes=timezoneMinutes;this.language=language;this.program=program;this.codepage=language==='chs'?936:932;
     machine.onImport=entry=>this.invoke(entry);this.d3d=new Direct3D9(this);this.input=new DirectInput8(this);this.sound=new DirectSound8(this);
     this.overlay=new Map();this.cwd='';this.directories=new Set(['']);
@@ -38,7 +40,7 @@ export class Win32Host {
     if(this.callGuest){const request=this.callGuest,calls=request.calls??[request];this.callGuest=null;let sp=m.reg('ESP'),next=m.reg('EIP');if(request.returnValue!==undefined){sp-=4;m.u32(sp,next);this.callbackReturns??=new Map();if(!this.callbackReturns.has(request.returnValue))this.callbackReturns.set(request.returnValue,m.registerImport({dll:'native-host',name:'callback.complete',argc:0,handler:()=>request.returnValue}));next=this.callbackReturns.get(request.returnValue);}for(let i=calls.length-1;i>=0;i--){const call=calls[i];for(let j=call.args.length-1;j>=0;j--){sp-=4;m.u32(sp,call.args[j]);}sp-=4;m.u32(sp,next);next=call.address;}m.reg('ESP',sp);m.reg('EIP',next);}
   }
   api={
-    DialogBoxParamA:[5,()=>7], // IDNO: use the original windowed path; HTML owns fullscreen.
+    DialogBoxParamA:[5,a=>a[1]===203?6:7], // TH13 may prompt to create/configure the game; the browser host should continue instead of exiting immediately on a default config check.
     FindWindowA:[2,()=>0],SetForegroundWindow:[1,()=>1],
     SendMessageA:[4,a=>{if(this.windowProc)this.callGuest={address:this.windowProc,args:a};return 0;}],
     DisableThreadLibraryCalls:[1,()=>1],
@@ -48,8 +50,10 @@ export class Win32Host {
     realloc:[2,a=>{const p=this.alloc(a[1]),size=Math.min(a[1],this.allocations.get(a[0])??0);if(size)this.m.write(p,this.m.bytes(a[0],size));this.free(a[0]);return p;}],
     '??2@YAPAXI@Z':[1,a=>this.alloc(a[0])],'??3@YAXPAX@Z':[1,a=>{this.free(a[0]);}],
     _initterm:[2,a=>{const calls=[];for(let p=a[0];p<a[1];p+=4){const address=this.m.u32(p);if(address)calls.push({address,args:[]});}if(calls.length)this.callGuest={calls};return 0;}],
-    _onexit:[1,a=>a[0]],__dllonexit:[3,a=>a[0]],srand:[1,()=>{}],
-    memmove:[3,a=>{this.m.write(a[0],this.m.bytes(a[1],a[2]));return a[0];}],
+    _onexit:[1,a=>a[0]],__dllonexit:[3,a=>a[0]],srand:[1,()=>{}],_lock:[0,()=>{}],_unlock:[0,()=>{}],
+    _CIsqrt:[0,()=>{this.m.reg('EIP',this.ciSqrtStub);return {blocked:true};}],
+    _CIatan:[0,()=>{this.m.reg('EIP',this.ciAtanStub);return {blocked:true};}],
+    memset:[3,a=>{this.m.view(a[0],a[2]).fill(a[1]&255);return a[0];}],memmove:[3,a=>{this.m.write(a[0],this.m.bytes(a[1],a[2]));return a[0];}],
     floor:[2,()=>({fp64:Math.floor(new DataView(this.m.bytes(this.m.reg('ESP')+4,8).buffer).getFloat64(0,true))})],
     ceil:[2,()=>({fp64:Math.ceil(new DataView(this.m.bytes(this.m.reg('ESP')+4,8).buffer).getFloat64(0,true))})],
     fabs:[2,()=>({fp64:Math.abs(new DataView(this.m.bytes(this.m.reg('ESP')+4,8).buffer).getFloat64(0,true))})],
@@ -63,19 +67,19 @@ export class Win32Host {
     SetTimer:[4,a=>this.handle({kind:'timer',window:a[0],id:a[1],interval:a[2],callback:a[3],last:this.millis})],KillTimer:[2,()=>1],
     timeSetEvent:[5,a=>this.handle({kind:'multimedia-timer',interval:a[0],callback:a[2],parameter:a[3],flags:a[4],last:this.millis})],timeKillEvent:[1,a=>{this.handles.delete(a[0]);return 0;}],
     GetVersion:[0,()=>0x0a280105],GetVersionExA:[1,a=>{const m=this.m;[5,1,2600,2].forEach((v,i)=>m.u32(a[0]+4+i*4,v));return 1;}],
-    GetModuleHandleA:[1,()=>0x400000],GetModuleFileNameA:[3,a=>this.putText(a[1],'C:\\th10\\'+this.program,a[2])],
+    GetModuleHandleA:[1,()=>0x400000],GetModuleHandleW:[1,()=>0x400000],GetModuleFileNameA:[3,a=>this.putText(a[1],'C:\\th10\\'+this.program,a[2])],
     GetCommandLineA:[0,()=>this.commandLine??=this.makeText('"C:\\th10\\'+this.program+'"')],
-    GetStartupInfoA:[1,a=>{this.m.u32(a[0],68);return 0;}],GetStdHandle:[1,a=>a[0]],SetStdHandle:[2,()=>1],GetFileType:[1,()=>2],SetHandleCount:[1,a=>a[0]],
+    GetStartupInfoA:[1,a=>{this.m.u32(a[0],68);return 0;}],GetStartupInfoW:[1,a=>{this.m.view(a[0],68).fill(0);this.m.u32(a[0],68);}],GetStdHandle:[1,a=>a[0]],SetStdHandle:[2,()=>1],GetFileType:[1,()=>2],SetHandleCount:[1,a=>a[0]],
     GetCurrentProcessId:[0,()=>1],GetCurrentThreadId:[0,()=>this.currentThreadId],GetCurrentProcess:[0,()=>0xffffffff],GetProcessHeap:[0,()=>1],
-    HeapCreate:[3,()=>1],HeapDestroy:[1,()=>1],HeapAlloc:[3,a=>{const p=this.alloc(a[2]);if(a[1]&8)this.m.view(p,a[2]).fill(0);return p;}],HeapFree:[3,a=>{this.free(a[2]);return 1;}],HeapSize:[3,a=>this.allocations.get(a[2])??0],
+    HeapCreate:[3,()=>1],HeapDestroy:[1,()=>1],HeapSetInformation:[4,()=>1],HeapAlloc:[3,a=>{const p=this.alloc(a[2]);if(a[1]&8)this.m.view(p,a[2]).fill(0);return p;}],HeapFree:[3,a=>{this.free(a[2]);return 1;}],HeapSize:[3,a=>this.allocations.get(a[2])??0],
     HeapReAlloc:[4,a=>{const p=this.alloc(a[3]),size=Math.min(a[3],this.allocations.get(a[2])??0);if(size)this.m.write(p,this.m.bytes(a[2],size));this.free(a[2]);return p;}],
     VirtualAlloc:[4,a=>{const p=this.alloc(a[1]);this.m.view(p,a[1]).fill(0);return p;}],VirtualFree:[3,a=>{this.free(a[0]);return 1;}],GlobalAlloc:[2,a=>{const p=this.alloc(a[1]);if(a[0]&0x40)this.m.view(p,a[1]).fill(0);return p;}],GlobalFree:[1,a=>{this.free(a[0]);return 0;}],LocalFree:[1,a=>{this.free(a[0]);return 0;}],
-    InitializeCriticalSection:[1,a=>{this.critical.set(a[0],{owner:0,count:0});}],EnterCriticalSection:[1,a=>{const lock=this.critical.get(a[0]);if(!lock)throw new Error('Uninitialized critical section '+hex(a[0]));if(lock.owner&&lock.owner!==this.currentThreadId){this.waitLock=a[0];this.m.cpu.emu_stop();return {blocked:true};}lock.owner=this.currentThreadId;lock.count++;}],LeaveCriticalSection:[1,a=>{const lock=this.critical.get(a[0]);if(!lock||lock.owner!==this.currentThreadId)throw new Error('Critical section owner mismatch');if(!--lock.count)lock.owner=0;}],DeleteCriticalSection:[1,a=>{this.critical.delete(a[0]);}],
+    InitializeCriticalSection:[1,a=>{this.critical.set(a[0],{owner:0,count:0});}],InitializeCriticalSectionAndSpinCount:[2,a=>{this.critical.set(a[0],{owner:0,count:0});return 1;}],EnterCriticalSection:[1,a=>{const lock=this.critical.get(a[0]);if(!lock)throw new Error('Uninitialized critical section '+hex(a[0]));if(lock.owner&&lock.owner!==this.currentThreadId){this.waitLock=a[0];this.m.cpu.emu_stop();return {blocked:true};}lock.owner=this.currentThreadId;lock.count++;}],LeaveCriticalSection:[1,a=>{const lock=this.critical.get(a[0]);if(!lock||lock.owner!==this.currentThreadId)throw new Error('Critical section owner mismatch');if(!--lock.count)lock.owner=0;}],DeleteCriticalSection:[1,a=>{this.critical.delete(a[0]);}],
     TlsAlloc:[0,()=>this.nextTLS++],TlsSetValue:[2,a=>{this.tls.set(this.currentThreadId+':'+a[0],a[1]);return 1;}],TlsGetValue:[1,a=>this.tls.get(this.currentThreadId+':'+a[0])??0],TlsFree:[1,()=>1],
-    GetLastError:[0,()=>this.error],SetLastError:[1,a=>{this.error=a[0];}],IsBadReadPtr:[2,()=>0],IsBadWritePtr:[2,()=>0],IsBadCodePtr:[1,()=>0],
+    GetLastError:[0,()=>this.error],SetLastError:[1,a=>{this.error=a[0];}],EncodePointer:[1,a=>a[0]],DecodePointer:[1,a=>a[0]],IsBadReadPtr:[2,()=>0],IsBadWritePtr:[2,()=>0],IsBadCodePtr:[1,()=>0],
     FormatMessageA:[7,a=>{const text='Windows error '+a[2]+'\r\n';if(a[0]&0x100)this.m.u32(a[4],this.makeText(text));else this.putText(a[4],text,a[5]);return text.length;}],
     SetUnhandledExceptionFilter:[1,a=>{const before=this.exceptionFilter??0;this.exceptionFilter=a[0];return before;}],
-    GetACP:[0,()=>this.codepage],GetOEMCP:[0,()=>this.codepage],SetEnvironmentVariableA:[2,()=>1],
+    GetACP:[0,()=>this.codepage],GetOEMCP:[0,()=>this.codepage],GetEnvironmentVariableA:[3,()=>{this.error=203;return 0;}],SetEnvironmentVariableA:[2,()=>1],
     GetEnvironmentStringsW:[0,()=>{const p=this.alloc(4);return p;}],GetEnvironmentStrings:[0,()=>this.makeText('')],FreeEnvironmentStringsW:[1,()=>1],FreeEnvironmentStringsA:[1,()=>1],
     GetCPInfo:[2,a=>{this.m.u32(a[1],2);this.m.write(a[1]+4,(a[0]||this.codepage)===936?[63,0,0x81,0xfe,0,0,0,0,0,0,0,0,0,0]:[63,0,0x81,0x9f,0xe0,0xfc,0,0,0,0,0,0,0,0]);return 1;}],
     GetLocaleInfoA:[4,a=>this.putText(a[2],a[1]===0x1004?String(this.codepage):this.codepage===936?'Chinese':'Japanese',a[3])+1],
@@ -95,7 +99,7 @@ export class Win32Host {
     GetSystemInfo:[1,a=>{const m=this.m;m.u32(a[0],0);m.u32(a[0]+4,4096);m.u32(a[0]+8,0x10000);m.u32(a[0]+12,0x7ffeffff);m.u32(a[0]+16,1);m.u32(a[0]+20,1);m.u32(a[0]+24,586);m.u32(a[0]+28,65536);}],
     CreateMutexA:[3,()=>this.handle({kind:'mutex'})],CreateEventA:[4,a=>this.handle({kind:'event',manual:!!a[1],signaled:!!a[2]})],CloseHandle:[1,a=>this.closeHandle(a[0])],SetEvent:[1,a=>{const e=this.handles.get(a[0]);if(e)e.signaled=true;return 1;}],ResetEvent:[1,a=>{const e=this.handles.get(a[0]);if(e)e.signaled=false;return 1;}],
     CreateThread:[6,a=>{const id=this.handle({kind:'thread',entry:a[2],parameter:a[3],suspended:!!(a[4]&4)});if(a[5])this.m.u32(a[5],id);this.pendingThreads.push({id,entry:a[2],parameter:a[3]});return id;}],
-    WaitForSingleObject:[2,a=>{const t=this.handles.get(a[0]);if(!t||t.kind!=='thread'||t.done)return 0;if(!a[1])return 258;this.waitHandle=a[0];this.yielded=true;this.m.cpu.emu_stop();return {blocked:true};}],
+    WaitForSingleObject:[2,a=>{const t=this.handles.get(a[0]),threadId=this.currentThreadId,timeout=a[1]>>>0;if(!t||t.kind!=='thread'||t.done){this.waits.delete(threadId);return 0;}let wait=this.waits.get(threadId);if(!wait||wait.handle!==a[0]){if(!timeout)return 258;wait={handle:a[0],deadline:timeout===0xffffffff?Infinity:this.millis+timeout};this.waits.set(threadId,wait);}if(wait.deadline!==Infinity&&this.millis>=wait.deadline){this.waits.delete(threadId);return 258;}this.waitHandle=a[0];this.waitDeadline=wait.deadline;this.yielded=true;this.m.cpu.emu_stop();return {blocked:true};}],
     MsgWaitForMultipleObjects:[5,a=>{for(let i=0;i<a[0];i++){const e=this.handles.get(this.m.u32(a[1]+i*4));if(e?.signaled||e?.done){if(e&&!e.manual)e.signaled=false;return i;}}if(this.messages.some(msg=>(msg.thread??1)===this.currentThreadId))return a[0];if(!a[3])return 258;this.sleepMs=1;this.m.cpu.emu_stop();return {blocked:true};}],
     RegOpenKeyA:[3,()=>2],RegQueryValueExA:[6,()=>2],RegCloseKey:[1,()=>0],
     CoInitialize:[1,()=>0],CoUninitialize:[0,()=>0],
@@ -116,7 +120,7 @@ export class Win32Host {
     GetStockObject:[1,a=>this.handle({kind:'stock',id:a[0]})],
     LoadCursorA:[2,()=>1],RegisterClassA:[1,a=>{this.windowProc=this.m.u32(a[0]+4);return 1;}],
     CreateWindowExA:[12,()=>{this.messages.push([1,0x1c,1,0]);return 1;}],ShowWindow:[2,()=>1],ShowCursor:[1,a=>a[0]?0:-1],SetCursor:[1,()=>1],SetActiveWindow:[1,()=>1],GetForegroundWindow:[0,()=>this.foreground===false?0:1],
-    GetWindowLongA:[2,()=>0],DefWindowProcA:[4,a=>{if(a[1]===0x10)this.messages.push([a[0],2,0,0]);return 0;}],GetWindowThreadProcessId:[2,a=>{if(a[1])this.m.u32(a[1],1);return 1;}],AttachThreadInput:[3,()=>1],MoveWindow:[6,()=>1],
+    GetWindowLongA:[2,()=>0],GetWindowRect:[2,a=>{this.m.u32(a[1],0);this.m.u32(a[1]+4,0);this.m.u32(a[1]+8,640);this.m.u32(a[1]+12,480);return 1;}],DefWindowProcA:[4,a=>{if(a[1]===0x10)this.messages.push([a[0],2,0,0]);return 0;}],GetWindowThreadProcessId:[2,a=>{if(a[1])this.m.u32(a[1],1);return 1;}],AttachThreadInput:[3,()=>1],MoveWindow:[6,()=>1],
     GetSystemMetrics:[1,a=>a[0]===0?640:a[0]===1?480:0],WINNLSEnableIME:[2,()=>1],SystemParametersInfoA:[4,()=>1],
     PeekMessageA:[5,a=>{const index=this.messages.findIndex(msg=>(msg.thread??1)===this.currentThreadId);if(index<0)return 0;const msg=this.messages[index];msg.forEach((v,i)=>this.m.u32(a[0]+4*i,v));this.m.u32(a[0]+16,Math.floor(this.millis));if(a[4]&1)this.messages.splice(index,1);return 1;}],TranslateMessage:[1,()=>1],DispatchMessageA:[1,a=>{if(this.windowProc)this.callGuest={address:this.windowProc,args:this.m.readWords(a[0],4)};return 0;}],
     PostThreadMessageA:[4,a=>{const msg=[0,a[1],a[2],a[3]];msg.thread=a[0];this.messages.push(msg);return 1;}],
